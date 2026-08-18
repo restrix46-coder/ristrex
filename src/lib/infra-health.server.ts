@@ -57,8 +57,11 @@ const CONTAINER_LABELS: Record<string, string> = {
 };
 
 async function probeRuntime(): Promise<ProbeState> {
+  // runtime container يمكن الوصول إليه باسم الخدمة 'runtime' داخل Docker network
+  const runtimeBase = process.env["RUNTIME_URL"] || "http://runtime:4100";
+  const url = `${runtimeBase.replace(/\/$/, "")}/health`;
   try {
-    const res = await fetch("http://127.0.0.1:4100/health", { signal: AbortSignal.timeout(5000) });
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
     return {
       ok: res.ok,
       label: "بيئة التنفيذ (فحص مباشر)",
