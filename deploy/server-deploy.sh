@@ -92,7 +92,17 @@ ensure_swap
 
 
 REPO_URL="${GITHUB_REPO_URL:-$(read_env GITHUB_REPO_URL)}"
+# Strip stray carriage returns that break URLs
+REPO_URL="$(printf '%s' "$REPO_URL" | tr -d '\r')"
 TOKEN="${GITHUB_TOKEN:-$(read_env GITHUB_TOKEN)}"
+
+# Persist corrected values back to .env so future deploys work without override
+if [ -n "$REPO_URL" ]; then
+  sed -i "s|^GITHUB_REPO_URL=.*|GITHUB_REPO_URL=$REPO_URL|" "$ENV_FILE"
+fi
+if [ -n "${GITHUB_TOKEN:-}" ] && [ "${GITHUB_TOKEN:-}" != "$(read_env GITHUB_TOKEN)" ]; then
+  sed -i "s|^GITHUB_TOKEN=.*|GITHUB_TOKEN=$TOKEN|" "$ENV_FILE"
+fi
 REF="${1:-}"
 
 if [ -z "$REPO_URL" ] || [ -z "$TOKEN" ]; then
