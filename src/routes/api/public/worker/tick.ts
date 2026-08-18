@@ -168,11 +168,12 @@ export const Route = createFileRoute("/api/public/worker/tick")({
             query: ((job.messages ?? []) as UIMessage[])
               .filter((message) => message.role === "user")
               .slice(-1)
-              .map((message) =>
-                (message.parts ?? [])
+              .map((message) => {
+                if (typeof message.content === "string") return message.content;
+                return (message.parts ?? [])
                   .map((part) => (part.type === "text" ? part.text : ""))
-                  .join(" "),
-              )
+                  .join(" ");
+              })
               .join(" ")
               .slice(0, 2000),
           });
