@@ -55,6 +55,7 @@ import { formatUsd } from "@/lib/pricing";
 import { clearTerminal, useTerminalEvents, type TerminalEvent } from "@/lib/terminal-bus";
 import { cn } from "@/lib/utils";
 import { startRuntimeDev } from "@/lib/runtime.functions";
+import { buildPreviewDocument } from "@/lib/preview";
 
 type PreviewDevice = "desktop" | "tablet" | "mobile";
 
