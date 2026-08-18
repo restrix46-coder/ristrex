@@ -45,7 +45,7 @@ export function candidatesFor(kind: TaskKind): Candidate[] {
   switch (kind) {
     case "fast":
       return [
-        { provider: "gemini", model: envModel("GEMINI_FAST_MODEL", "gemini-pro-latest") },
+        { provider: "gemini", model: envModel("GEMINI_FAST_MODEL", "gemini-flash-latest") },
         { provider: "gemini", model: envModel("GEMINI_PRO_MODEL", "gemini-3.1-pro-preview") },
         { provider: "gemini", model: envModel("GEMINI_FALLBACK_MODEL", "gemini-flash-latest") },
       ];
@@ -59,7 +59,7 @@ export function candidatesFor(kind: TaskKind): Candidate[] {
     case "coding":
     default:
       return [
-        { provider: "gemini", model: envModel("GEMINI_REASONING_MODEL", "gemini-pro-latest") },
+        { provider: "gemini", model: envModel("GEMINI_REASONING_MODEL", "gemini-3.1-pro-preview") },
         { provider: "gemini", model: envModel("GEMINI_PRO_MODEL", "gemini-3.1-pro-preview") },
         { provider: "gemini", model: envModel("GEMINI_FAST_MODEL", "gemini-flash-latest") },
       ];
