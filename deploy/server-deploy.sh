@@ -1,0 +1,280 @@
+#!/bin/bash
+# نشر Weaver من داخل الخادم نفسه (يُستدعى من خطّاف النشر deploy-hook.mjs).
+# يسحب آخر كود من GitHub، يحتفظ بنسخة احتياطية للتراجع، ثم يعيد بناء الحاويات ويتحقق من الصحة.
+set -e
+
+# السكربت يستبدل ملفات المشروع (ومنها هذا الملف نفسه) أثناء التنفيذ،
+# وbash يقرأ الملف تدريجياً فيتعطّل. لذلك ننسخه إلى /tmp ونعيد تشغيله من هناك.
+if [ -z "${WEAVER_SELF_COPY:-}" ]; then
+  SELF_COPY="$(mktemp /tmp/weaver-deploy-XXXXXX.sh)"
+  cat "$0" > "$SELF_COPY"
+  chmod +x "$SELF_COPY"
+  WEAVER_SELF_COPY=1 exec bash "$SELF_COPY" "$@"
+fi
+
+ROOT="${WEAVER_ROOT:-/opt/weaver}"
+ENV_FILE="$ROOT/deploy/.env"
+BACKUP="${WEAVER_BACKUP:-/opt/weaver-prev}"
+PORT="${WEAVER_HTTP_PORT:-8081}"
+RELEASE_FILE=".weaver-release"
+
+if [ ! -f "$ENV_FILE" ]; then
+  echo "ملف الإعدادات $ENV_FILE غير موجود"
+  exit 1
+fi
+
+read_env() { grep -m1 "^$1=" "$ENV_FILE" | cut -d= -f2- || true; }
+
+# Runtime أساسي للمعاينة والبناء. ولّد سراً فعلياً عند غيابه أو بقاء قيمة المثال.
+EXECUTOR_TOKEN_VALUE="$(read_env EXECUTOR_TOKEN)"
+if [ ${#EXECUTOR_TOKEN_VALUE} -lt 16 ] || [ "$EXECUTOR_TOKEN_VALUE" = "replace-with-executor-token-from-app" ]; then
+  GENERATED_EXECUTOR_TOKEN="$(openssl rand -hex 32)"
+  if grep -q '^EXECUTOR_TOKEN=' "$ENV_FILE"; then
+    sed -i "s/^EXECUTOR_TOKEN=.*/EXECUTOR_TOKEN=$GENERATED_EXECUTOR_TOKEN/" "$ENV_FILE"
+  else
+    printf '\nEXECUTOR_TOKEN=%s\n' "$GENERATED_EXECUTOR_TOKEN" >> "$ENV_FILE"
+  fi
+  chmod 600 "$ENV_FILE"
+  unset GENERATED_EXECUTOR_TOKEN
+fi
+
+# ====== إعدادات المعاينة قبل النشر (staging) ======
+# تُضاف مرة واحدة فقط، ولا تُلمس إن كانت موجودة (المستخدم قد يخصّصها).
+ensure_env_default() {
+  if ! grep -q "^$1=" "$ENV_FILE"; then
+    printf '\n%s=%s\n' "$1" "$2" >> "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+  fi
+}
+STAGE_PORT_VALUE="$(read_env WEAVER_STAGE_PORT)"
+STAGE_PORT_VALUE="${STAGE_PORT_VALUE:-8090}"
+SERVER_IP_VALUE="$(read_env WEAVER_SERVER_IP)"
+if [ -z "$SERVER_IP_VALUE" ]; then
+  SERVER_IP_VALUE="$(curl -sf --max-time 5 https://api.ipify.org || hostname -I | awk '{print $1}')"
+fi
+ensure_env_default WEAVER_STAGE_PORT "$STAGE_PORT_VALUE"
+ensure_env_default WEAVER_SERVER_IP "$SERVER_IP_VALUE"
+ensure_env_default PLATFORM_STAGE_URL "http://$SERVER_IP_VALUE:$STAGE_PORT_VALUE"
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  ufw allow "$STAGE_PORT_VALUE"/tcp >/dev/null 2>&1 || true
+fi
+
+
+
+# ====== شبكة أمان الذاكرة: ملف swap دائم ======
+# خادم واحد يحمل المنصة والبناء معاً، وذروة npm/vite قد تستهلك الرام كاملة.
+# ننشئ swap مرة واحدة (idempotent) ونثبّته في fstab ليبقى بعد إعادة التشغيل.
+SWAP_FILE="${WEAVER_SWAP_FILE:-/swapfile}"
+SWAP_SIZE="${WEAVER_SWAP_SIZE:-4G}"
+ensure_swap() {
+  if [ "$(id -u)" != "0" ]; then return 0; fi
+  if [ "$(swapon --show --noheadings 2>/dev/null | wc -l)" -gt 0 ]; then
+    echo "== swap: مفعّل مسبقاً =="
+    return 0
+  fi
+  echo "== swap: إنشاء $SWAP_FILE بحجم $SWAP_SIZE =="
+  if [ ! -f "$SWAP_FILE" ]; then
+    fallocate -l "$SWAP_SIZE" "$SWAP_FILE" 2>/dev/null \
+      || dd if=/dev/zero of="$SWAP_FILE" bs=1M count=4096 status=none || return 0
+  fi
+  chmod 600 "$SWAP_FILE"
+  mkswap "$SWAP_FILE" >/dev/null 2>&1 || true
+  swapon "$SWAP_FILE" 2>/dev/null || { echo "== swap: تعذّر التفعيل (بيئة مقيّدة) =="; return 0; }
+  grep -q "^$SWAP_FILE " /etc/fstab 2>/dev/null || echo "$SWAP_FILE none swap sw 0 0" >> /etc/fstab
+  # الاعتماد على القرص فقط عند الضرورة، مع إبقاء الكاش نشطاً.
+  sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
+  sysctl -w vm.vfs_cache_pressure=50 >/dev/null 2>&1 || true
+  grep -q '^vm.swappiness' /etc/sysctl.conf 2>/dev/null \
+    || printf 'vm.swappiness=10\nvm.vfs_cache_pressure=50\n' >> /etc/sysctl.conf
+  echo "== swap: جاهز =="
+}
+ensure_swap
+
+
+REPO_URL="$(read_env GITHUB_REPO_URL)"
+TOKEN="$(read_env GITHUB_TOKEN)"
+REF="${1:-}"
+
+if [ -z "$REPO_URL" ] || [ -z "$TOKEN" ]; then
+  echo "GITHUB_REPO_URL و GITHUB_TOKEN مطلوبان في deploy/.env للنشر الذاتي"
+  exit 1
+fi
+
+SLUG="$(printf '%s' "$REPO_URL" | sed -E 's#(https?://)?(www\.)?github\.com/##; s#\.git$##; s#/+$##')"
+BRANCH="${REF:-$(curl -sf -H "Authorization: Bearer $TOKEN" "https://api.github.com/repos/$SLUG" | grep -o '"default_branch": *"[^"]*"' | head -1 | cut -d'"' -f4)}"
+BRANCH="${BRANCH:-main}"
+
+echo "== سحب $SLUG@$BRANCH =="
+TMP="$(mktemp -d)"
+curl -fsSL -H "Authorization: Bearer $TOKEN" \
+  "https://api.github.com/repos/$SLUG/tarball/$BRANCH" -o "$TMP/src.tar.gz"
+mkdir -p "$TMP/src"
+tar xzf "$TMP/src.tar.gz" -C "$TMP/src" --strip-components=1
+
+if [ ! -f "$TMP/src/package.json" ]; then
+  echo "الأرشيف المسحوب غير صالح (لا يوجد package.json)"
+  rm -rf "$TMP"
+  exit 1
+fi
+
+# Never let an old/incomplete repository snapshot erase a newer Weaver install.
+# قراءة علامة الإصدار: يُفضَّل .weaver-release، وإلا الحقل weaverRelease في package.json
+# (بعض أدوات المزامنة لا ترفع ملفات النقطة في الجذر، فيبقى package.json مصدراً موثوقاً).
+read_release() {
+  local dir="$1"
+  if [ -f "$dir/$RELEASE_FILE" ]; then
+    tr -d '\r\n' < "$dir/$RELEASE_FILE"
+    return
+  fi
+  if [ -f "$dir/package.json" ]; then
+    grep -m1 '"weaverRelease"' "$dir/package.json" 2>/dev/null | sed -E 's/.*"weaverRelease" *: *"([^"]*)".*/\1/'
+  fi
+}
+
+INSTALLED_RELEASE="$(read_release "$ROOT")"
+CANDIDATE_RELEASE="$(read_release "$TMP/src")"
+if [ -n "$INSTALLED_RELEASE" ]; then
+  # يُقبل النشر فقط إذا كانت نسخة GitHub مطابقة للنسخة المثبّتة أو أحدث منها.
+  NEWEST="$(printf '%s\n%s\n' "$INSTALLED_RELEASE" "$CANDIDATE_RELEASE" | sort -V | tail -1)"
+  if [ -z "$CANDIDATE_RELEASE" ] || { [ "$CANDIDATE_RELEASE" != "$INSTALLED_RELEASE" ] && [ "$NEWEST" != "$CANDIDATE_RELEASE" ]; }; then
+    echo "رفض النشر: نسخة GitHub أقدم أو غير متزامنة (installed=$INSTALLED_RELEASE, candidate=${CANDIDATE_RELEASE:-missing})."
+    echo "زامن مستودع Weaver أولاً؛ لم يتم تغيير النسخة العاملة."
+    rm -rf "$TMP"
+    exit 1
+  fi
+fi
+
+# تثبيت علامة الإصدار الجديدة بصيغة الملف حتى لو جاءت من package.json فقط.
+if [ -n "$CANDIDATE_RELEASE" ]; then
+  printf '%s\n' "$CANDIDATE_RELEASE" > "$TMP/src/$RELEASE_FILE"
+fi
+
+BACKUP_DIR="${WEAVER_BACKUP_DIR:-$ROOT/backups}"
+mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"
+
+echo "== نسخة احتياطية لقاعدة البيانات قبل النشر =="
+if [ -d "$ROOT/deploy" ]; then
+  (cd "$ROOT/deploy" && docker compose exec -T db pg_dump -U weaver -d weaver --clean --if-exists \
+    | gzip -9 > "$BACKUP_DIR/pre-deploy-$(date -u +%Y%m%d-%H%M%S).sql.gz") \
+    && echo "DB_BACKUP: ok" || echo "DB_BACKUP: skipped (قاعدة البيانات غير متاحة)"
+fi
+
+echo "== نسخة احتياطية للتراجع =="
+rm -rf "$BACKUP"
+mkdir -p "$BACKUP"
+tar cf - -C "$ROOT" --exclude=node_modules --exclude=.output --exclude=dist --exclude=backups . | tar xf - -C "$BACKUP"
+
+echo "== تحديث الكود =="
+# استبدال نظيف: قد يحتوي الإصدار الحالي على ملفات جذرية تخص موقع عميل
+# (index.html/styles.css/...) نتيجة رفع خاطئ سابق. إبقاؤها يجعل Vite يبني
+# موقع العميل بدلاً من Weaver حتى لو كانت src الجديدة صحيحة.
+SAVED_ENV="$(mktemp)"
+cp "$BACKUP/deploy/.env" "$SAVED_ENV"
+# احذف فقط عناصر الجذر الدخيلة التي لا وجود لها في نسخة Weaver الجديدة.
+# لا تحذف مجلد deploy الجاري تنفيذه ولا مجلد النسخ الاحتياطية.
+for current in "$ROOT"/* "$ROOT"/.[!.]* "$ROOT"/..?*; do
+  [ -e "$current" ] || continue
+  name="$(basename "$current")"
+  [ "$name" = "backups" ] && continue
+  [ -e "$TMP/src/$name" ] || rm -rf "$current"
+done
+cp -a "$TMP/src/." "$ROOT/"
+# لا نسمح للكود المسحوب بأن يمسح أسرار الخادم
+mkdir -p "$(dirname "$ENV_FILE")"
+cp "$SAVED_ENV" "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+rm -f "$SAVED_ENV"
+rm -rf "$TMP"
+chmod +x "$ROOT/deploy/db/backup.sh" "$ROOT/deploy/db/restore.sh" 2>/dev/null || true
+
+echo "== إعادة البناء =="
+cd "$ROOT/deploy"
+# مهلة قصوى: لا نترك النشر معلّقاً للأبد إذا تأخّرت إحدى الحاويات.
+# 15 دقيقة تكفي للبناء الكامل؛ ما فوق ذلك يُشير إلى مشكلة حقيقية.
+build_rc=0
+timeout 900 docker compose up -d --build || build_rc=$?
+if [ "$build_rc" -ne 0 ]; then
+  echo "BUILD: FAIL (rc=$build_rc)"
+  echo "== تراجع تلقائي إلى الإصدار السابق =="
+  docker compose up -d 2>&1 | tail -5 || true
+  echo "DEPLOY: FAIL"
+  exit 1
+fi
+# nginx يولّد ملفه النهائي عند بدء الحاوية من init-ssl.sh. تغيّر السكربت المركّب
+# لا يعيد تشغيل حاوية nginx تلقائياً، لذا يجب إعادة إنشائها لتفعيل مسارات المعاينة الجديدة.
+docker compose up -d --force-recreate nginx
+echo "BUILD: OK"
+
+for i in $(seq 1 30); do docker compose exec -T db pg_isready -U weaver >/dev/null 2>&1 && break; sleep 2; done
+# تطبيق الترحيلات مع ON_ERROR_STOP — أي فشل يوقف النشر فوراً لحماية المخطط.
+for f in $(ls db/init/*.sql 2>/dev/null | sort); do
+  echo "MIGRATION: تطبيق $f"
+  if ! docker compose exec -T db psql -U weaver -d weaver -v ON_ERROR_STOP=1 < "$f" >/dev/null 2>&1; then
+    echo "MIGRATION FAILED: $f"
+    echo "== تراجع تلقائي بسبب فشل الترحيل =="
+    docker compose up -d 2>&1 | tail -5 || true
+    echo "DEPLOY: FAIL (migration error)"
+    exit 1
+  fi
+  echo "MIGRATION OK: $f"
+done
+
+WEAVER_WORKER_TOKEN="${WEAVER_WORKER_TOKEN:-$(grep -m1 "^WEAVER_WORKER_TOKEN=" .env 2>/dev/null | cut -d= -f2-)}"
+echo "== التحقق =="
+body=""
+for i in $(seq 1 40); do
+  body=$(curl -sf -H "Authorization: Bearer ${WEAVER_WORKER_TOKEN:-}" "http://127.0.0.1:$PORT/api/public/health" || true)
+  case "$body" in *'"ok":true'*) break;; esac
+  sleep 5
+done
+echo "HEALTH: ${body:-<no response>}"
+
+# بيئة التنفيذ جزء أساسي من البناء والمعاينة؛ فشلها يفشل الإصدار بدل نشر نسخة ناقصة.
+rt=""
+for i in $(seq 1 20); do
+  rt=$(docker compose exec -T runtime node -e "fetch('http://127.0.0.1:4100/health').then(r=>r.text()).then(t=>console.log(t)).catch(()=>process.exit(1))" 2>/dev/null || true)
+  case "$rt" in *'"ok":true'*) break;; esac
+  sleep 3
+done
+echo "RUNTIME: ${rt:-<not ready>}"
+
+case "${rt:-}" in
+  *'"ok":true'*) ;;
+  *)
+    echo "DEPLOY: FAIL (runtime unavailable)"
+    docker compose logs --tail=80 runtime 2>&1 | sed -E 's/(token|secret|password|key)=?[^ ]*/\1=[REDACTED]/Ig' || true
+    exit 1
+    ;;
+esac
+
+# لا يكفي أن تجيب runtime من داخل حاويتها: اختبر المسار نفسه الذي تستخدمه الواجهة.
+# أي رد HTTP سليم (200/404) يعني أن السلسلة تعمل؛ الفشل الحقيقي هو 000/502/503.
+preview_status=$(curl -sS -o /tmp/weaver-runtime-probe.html -w "%{http_code}" \
+  "http://127.0.0.1:$PORT/api/public/rt/deploy-probe/" || true)
+echo "RUNTIME_PROXY: HTTP ${preview_status:-000}"
+case "${preview_status:-000}" in
+  000|502|503|504)
+    echo "DEPLOY: FAIL (runtime proxy unavailable)"
+    cat /tmp/weaver-runtime-probe.html 2>/dev/null | head -5 || true
+    exit 1
+    ;;
+esac
+
+case "${body:-}" in
+  *'"ok":true'*) echo "DEPLOY: PASS";;
+  *) echo "DEPLOY: FAIL"; exit 1;;
+esac
+
+# بعد نجاح النشر لم تعد نسخة المعاينة لازمة — نوقفها لتحرير الذاكرة على الخادم الواحد.
+if docker ps --format '{{.Names}}' | grep -q '^weaver-stage$'; then
+  echo "== إيقاف نسخة المعاينة بعد النشر =="
+  docker rm -f weaver-stage >/dev/null 2>&1 || true
+fi
+
+
+# خطّاف النشر يعمل كخدمة systemd على المضيف، وتحديثه لا يسري إلا بإعادة تشغيله.
+# نؤجّل إعادة التشغيل قليلاً حتى تنتهي هذه المهمة وتُسلَّم نتيجتها للمنصة.
+if [ "$(id -u)" = "0" ] && command -v systemctl >/dev/null 2>&1; then
+  setsid bash -c 'sleep 10; systemctl restart weaver-deploy-hook.service' >/dev/null 2>&1 < /dev/null &
+fi

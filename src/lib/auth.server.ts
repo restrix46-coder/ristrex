@@ -1,0 +1,137 @@
+import { createHash, timingSafeEqual } from "node:crypto";
+import { getRequest } from "@tanstack/react-start/server";
+import { SESSION_SECRET, WEAVER_PUBLIC_URL } from "@/lib/env.server";
+import { logger } from "@/lib/logger.server";
+import { authRateLimiter, retryAfterHeaders } from "@/lib/rate-limit.server";
+
+/**
+ * Session-only owner identity. No Supabase Auth; the passcode is the only gate.
+ */
+export type WeaverSession = {
+  /** Owner identity derived from the configured owner email. */
+  owner: {
+    id: string;
+    email: string;
+  };
+};
+
+export function hashPassword(input: string): Buffer {
+  return createHash("sha256").update(input, "utf8").digest();
+}
+
+export function passwordMatches(input: string, expected: string): boolean {
+  const a = hashPassword(input);
+  const b = hashPassword(expected);
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
+/**
+ * The database stores owner ids in `uuid` columns, so the deterministic id is
+ * formatted as a RFC 4122 v5-style UUID derived from the email instead of a
+ * raw sha256 hex digest (which Postgres rejects).
+ */
+export function getOwnerId(email: string): string {
+  const hex = createHash("sha256").update(email.trim().toLowerCase(), "utf8").digest("hex");
+  const version = "5";
+  const variant = ((parseInt(hex[16]!, 16) & 0x3) | 0x8).toString(16);
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    version + hex.slice(13, 16),
+    variant + hex.slice(17, 20),
+    hex.slice(20, 32),
+  ].join("-");
+}
+
+/**
+ * Cookies flagged `secure` are dropped by browsers on plain HTTP, which would
+ * silently break the passcode session before a TLS certificate is installed.
+ * Detect the actual request protocol behind the reverse proxy instead.
+ */
+function isSecureRequest(): boolean {
+  try {
+    const request = getRequest();
+    const proto = request?.headers?.get("x-forwarded-proto");
+    if (proto) return proto.split(",")[0]!.trim() === "https";
+    if (request?.url) return new URL(request.url).protocol === "https:";
+  } catch {
+    // No request context (e.g. background jobs) — fall back to the env hint.
+  }
+  return WEAVER_PUBLIC_URL.startsWith("https://");
+}
+
+export function getSessionConfig() {
+  if (!SESSION_SECRET || SESSION_SECRET.length < 32) {
+    throw new Error("SESSION_SECRET is not set or too short (minimum 32 characters).");
+  }
+  return {
+    password: SESSION_SECRET,
+    name: "weaver-session",
+    maxAge: 60 * 60 * 24 * 7, // 7 days
+    cookie: {
+      httpOnly: true,
+      secure: isSecureRequest(),
+      sameSite: "lax" as const,
+      path: "/",
+    },
+  };
+}
+
+/**
+ * حماية من التخمين (brute force) على رمز الدخول الوحيد.
+ * المنصة أحادية المالك، لذا العدّاد عام: بعد MAX_FAILS محاولة فاشلة يُقفل
+ * الدخول لمدة تصاعدية حتى تنتهي النافذة.
+ */
+const MAX_FAILS = 6;
+const LOCK_MS = 5 * 60_000;
+const gate = { fails: 0, lockedUntil: 0 };
+
+export function passcodeGateStatus(): { locked: boolean; retryAfterSec: number } {
+  const now = Date.now();
+  if (gate.lockedUntil > now) {
+    return { locked: true, retryAfterSec: Math.ceil((gate.lockedUntil - now) / 1000) };
+  }
+  if (gate.lockedUntil && gate.lockedUntil <= now) {
+    gate.lockedUntil = 0;
+    gate.fails = 0;
+  }
+  return { locked: false, retryAfterSec: 0 };
+}
+
+export function notePasscodeFailure(clientIp?: string): void {
+  gate.fails += 1;
+  if (gate.fails >= MAX_FAILS) {
+    // قفل تصاعدي: كل تجاوز إضافي يضاعف مدة القفل حتى ساعة كحد أقصى.
+    const factor = Math.min(2 ** (gate.fails - MAX_FAILS), 12);
+    gate.lockedUntil = Date.now() + LOCK_MS * factor;
+  }
+  logger.warn("فشل في محاولة المصادقة", {
+    failCount: gate.fails,
+    locked: gate.lockedUntil > Date.now(),
+    clientIp,
+  });
+}
+
+export function resetPasscodeGate(): void {
+  gate.fails = 0;
+  gate.lockedUntil = 0;
+}
+
+/**
+ * تحقق من Rate Limiting مع IP لمنع هجمات التخمين الموزّعة.
+ * يُدمج مع passcodeGateStatus() للحصول على حماية مزدوجة.
+ */
+export function checkAuthRateLimit(clientIp: string): { allowed: boolean; retryAfter?: number } {
+  const result = authRateLimiter(clientIp);
+  if (!result.allowed) {
+    logger.warn("طلب مصادقة مرفوض بسبب Rate Limit", {
+      clientIp,
+      retryAfter: result.retryAfter,
+    });
+  }
+  return { allowed: result.allowed, retryAfter: result.retryAfter };
+}
+
+/** رؤوس HTTP لاستجابة 429 Too Many Requests */
+export { retryAfterHeaders };

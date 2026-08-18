@@ -1,0 +1,308 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { convertToModelMessages, generateText, stepCountIs, type UIMessage } from "ai";
+import { resolveBuildModel } from "@/lib/build-provider.server";
+import { getSql } from "@/lib/db";
+import { bearerToken, secretEquals } from "@/lib/token-compare";
+import { compactMessages } from "@/lib/context-compaction";
+import { makeLocalSupabase } from "@/lib/local-supabase";
+import { estimateCostUsd } from "@/lib/pricing";
+import { withTokenBudget } from "@/lib/token-budget.server";
+import { buildProjectExecutionContext } from "@/lib/project-execution.server";
+import { buildKnowledgeContext } from "@/lib/knowledge.server";
+import {
+  buildWeaverSystem,
+  buildWeaverToolset,
+  applyToolResult,
+  hasBuildIntent,
+  isBuildIncomplete,
+  statusPrompt,
+  MAX_STEPS,
+  TIME_BUDGET_MS,
+  type LifecycleState,
+} from "@/routes/api/chat";
+import {
+  claimNextJob,
+  ensureAgentJobs,
+  finishJob,
+  logJobEvent,
+  requeueForContinuation,
+  setJobPhase,
+} from "@/lib/agent-jobs.server";
+
+/**
+ * نقطة العامل الخلفي الدائم: يسحب مهمة واحدة من الطابور وينفّذ حلقة الوكيل
+ * كاملة على الخادم — يكمل البناء حتى لو أُغلق المتصفح.
+ */
+export const Route = createFileRoute("/api/public/worker/tick")({
+  server: {
+    handlers: {
+      POST: async ({ request }) => {
+        const token = process.env["WEAVER_WORKER_TOKEN"];
+        if (!token || token.length < 16) {
+          return Response.json({ ok: false, error: "worker_token_missing" }, { status: 500 });
+        }
+        if (!secretEquals(bearerToken(request.headers.get("authorization")), token)) {
+          return Response.json({ ok: false, error: "unauthorized" }, { status: 401 });
+        }
+
+        const hasAnyProvider = Boolean(
+          process.env["GEMINI_API_KEY"],
+        );
+        if (!hasAnyProvider) {
+          return Response.json({ ok: false, error: "missing_model_provider_key" }, { status: 500 });
+        }
+
+        await ensureAgentJobs();
+        const job = await claimNextJob();
+        if (!job) return Response.json({ ok: true, idle: true });
+
+        const sql = getSql();
+        const supabase = makeLocalSupabase(sql, job.user_id);
+        const ctx = { supabase, userId: job.user_id };
+        const projectId = job.project_id;
+        const origin = new URL(request.url).origin;
+        const modelId = job.model ?? "gemini-pro-latest";
+        const routed = resolveBuildModel(modelId, origin);
+        const skills = Array.isArray(job.skills) ? (job.skills as string[]) : [];
+        const startedAt = Date.now();
+
+        const lifecycle: LifecycleState = {
+          hasDesignBlueprint: false,
+          hasTasks: false,
+          allTasksDone: false,
+          hasFiles: false,
+          checksPassed: false,
+          designPassed: false,
+          published: false,
+          acted: false,
+        };
+
+        if (projectId) {
+          try {
+            const [
+              taskRows,
+              fileRows,
+              projectRows,
+              checkRows,
+              blueprintRows,
+              designRows,
+              latestFileRows,
+            ] = await Promise.all([
+              sql`
+                SELECT count(*)::int AS count,
+                       count(*) FILTER (WHERE status <> 'done')::int AS open_count
+                FROM public.tasks WHERE project_id = ${projectId}
+              `,
+              sql`SELECT count(*)::int AS count FROM public.files WHERE project_id = ${projectId}`,
+              sql`SELECT published FROM public.projects WHERE id = ${projectId} LIMIT 1`,
+              sql`
+                SELECT status FROM public.runs
+                WHERE project_id = ${projectId} AND kind = 'check'
+                ORDER BY created_at DESC LIMIT 1
+              `,
+              sql`
+                SELECT count(*)::int AS count FROM public.project_memory
+                WHERE project_id = ${projectId} AND key = 'design.blueprint'
+              `,
+              sql`
+                SELECT status, created_at FROM public.runs
+                WHERE project_id = ${projectId} AND kind = 'design'
+                ORDER BY created_at DESC LIMIT 1
+              `,
+              sql`
+                SELECT updated_at FROM public.files
+                WHERE project_id = ${projectId}
+                ORDER BY updated_at DESC LIMIT 1
+              `,
+            ]);
+            const taskSummary = taskRows[0] as { count?: number; open_count?: number } | undefined;
+            lifecycle.hasTasks = Number(taskSummary?.count ?? 0) > 0;
+            lifecycle.allTasksDone =
+              lifecycle.hasTasks && Number(taskSummary?.open_count ?? 0) === 0;
+            lifecycle.hasFiles =
+              Number((fileRows[0] as { count?: number } | undefined)?.count ?? 0) > 0;
+            lifecycle.published =
+              (projectRows[0] as { published?: boolean } | undefined)?.published === true;
+            lifecycle.checksPassed =
+              (checkRows[0] as { status?: string } | undefined)?.status === "passed";
+            lifecycle.hasDesignBlueprint =
+              Number((blueprintRows[0] as { count?: number } | undefined)?.count ?? 0) > 0;
+            const design = designRows[0] as { status?: string; created_at?: string } | undefined;
+            const latestFile = latestFileRows[0] as { updated_at?: string } | undefined;
+            const designAt = design?.created_at ? Date.parse(design.created_at) : 0;
+            const fileAt = latestFile?.updated_at ? Date.parse(latestFile.updated_at) : 0;
+            lifecycle.designPassed = design?.status === "passed" && fileAt - designAt <= 60_000;
+          } catch (error) {
+            console.error("[weaver:worker:lifecycle]", error);
+          }
+        }
+
+        const buildIntent =
+          job.mode === "build" && hasBuildIntent((job.messages ?? []) as UIMessage[]);
+
+        let steps = 0;
+        try {
+          const tools = buildWeaverToolset(
+            ctx,
+            projectId,
+            origin,
+            (name, value) => applyToolResult(lifecycle, name, value),
+            (event) => {
+              void logJobEvent({
+                jobId: job.id,
+                projectId,
+                kind: "tool",
+                label: event.name,
+                detail: event.detail ?? null,
+                ok: event.ok,
+                durationMs: event.durationMs,
+                attempt: event.attempt,
+              });
+              void setJobPhase(job.id, `${event.ok ? "نفّذ" : "أعاد المحاولة"}: ${event.name}`);
+            },
+          );
+          const executionContext = await buildProjectExecutionContext(supabase, projectId);
+          // نفس الذاكرة المعرفية المتاحة في المحادثة تتاح للعامل الخلفي
+          const knowledgeContext = await buildKnowledgeContext({
+            userId: job.user_id,
+            query: ((job.messages ?? []) as UIMessage[])
+              .filter((message) => message.role === "user")
+              .slice(-1)
+              .map((message) =>
+                (message.parts ?? [])
+                  .map((part) => (part.type === "text" ? part.text : ""))
+                  .join(" "),
+              )
+              .join(" ")
+              .slice(0, 2000),
+          });
+
+          const result = await withTokenBudget(async (maxOutputTokens) =>
+            generateText({
+              model: routed.model,
+              system:
+                buildWeaverSystem(skills, job.mode) +
+                statusPrompt(lifecycle, buildIntent) +
+                executionContext +
+                knowledgeContext,
+              messages: await convertToModelMessages(
+                compactMessages((job.messages ?? []) as UIMessage[]),
+              ),
+              tools,
+              stopWhen: [stepCountIs(MAX_STEPS), () => Date.now() - startedAt > TIME_BUDGET_MS * 3],
+              maxOutputTokens,
+              onStepFinish: () => {
+                steps += 1;
+                void setJobPhase(job.id, `خطوة ${steps} من ${MAX_STEPS}`, steps);
+              },
+            }),
+          );
+
+          // تسجيل الاستهلاك
+          try {
+            const usage = result.totalUsage;
+            const inputTokens = usage?.inputTokens ?? 0;
+            const outputTokens = usage?.outputTokens ?? 0;
+            if (inputTokens || outputTokens) {
+              await supabase.from("usage_events").insert({
+                project_id: projectId,
+                user_id: job.user_id,
+                model: modelId,
+                input_tokens: inputTokens,
+                output_tokens: outputTokens,
+                total_tokens: usage?.totalTokens ?? inputTokens + outputTokens,
+                cost_usd: estimateCostUsd(modelId, inputTokens, outputTokens),
+              });
+            }
+          } catch {
+            /* الاستهلاك لا يُفشل المهمة */
+          }
+
+          // إلحاق ردّ المساعد بالمحادثة حتى يراه المستخدم عند العودة
+          if (projectId && result.text.trim()) {
+            try {
+              await sql`SELECT public.append_message_atomic(${projectId},${job.user_id},${sql.json({ id: `bg-${job.id}`, role: "assistant", parts: [{ type: "text", text: result.text }] } as never)})`;
+            } catch (error) {
+              console.error("[weaver:worker:persist]", error);
+            }
+          }
+
+          const incomplete = isBuildIncomplete(lifecycle, buildIntent);
+
+          if (incomplete && job.attempts < job.max_attempts) {
+            await requeueForContinuation(job, result.text);
+            await logJobEvent({
+              jobId: job.id,
+              projectId,
+              kind: "requeue",
+              label: "متابعة تلقائية",
+              detail: JSON.stringify(lifecycle),
+              ok: true,
+              attempt: job.attempts,
+            });
+            return Response.json({ ok: true, jobId: job.id, requeued: true, steps });
+          }
+
+          await finishJob({
+            jobId: job.id,
+            status: incomplete ? "error" : "done",
+            phase: incomplete ? "توقف قبل الاكتمال بعد استنفاد المحاولات" : "اكتمل",
+            resultText: result.text,
+            error: incomplete
+              ? "لم تجتز المهمة بوابات الملفات والفحص والنشر ضمن حد المحاولات."
+              : null,
+            steps,
+          });
+          await logJobEvent({
+            jobId: job.id,
+            projectId,
+            kind: "finish",
+            label: "اكتملت المهمة",
+            ok: !incomplete,
+            durationMs: Date.now() - startedAt,
+            attempt: job.attempts,
+          });
+          return Response.json({
+            ok: !incomplete,
+            jobId: job.id,
+            steps,
+            done: !incomplete,
+            incomplete,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error("[weaver:worker]", message);
+          const retry = job.attempts < job.max_attempts;
+
+          if (retry) {
+            await requeueForContinuation(
+              job,
+              `فشلت الجولة السابقة بهذا الخطأ:\n${message.slice(0, 1000)}`,
+              "تابع التنفيذ من آخر حالة محفوظة. عالج الخطأ السابق بسبب مختلف أو أداة بديلة، ثم أكمل الملفات والفحص والنشر. لا تكرر نفس الإجراء الفاشل بلا تغيير.",
+              "خطأ مؤقت — إعادة محاولة بسياق الإصلاح",
+            );
+          } else {
+            await finishJob({
+              jobId: job.id,
+              status: "error",
+              phase: "فشل بعد استنفاد المحاولات",
+              error: message,
+              steps,
+            });
+          }
+          await logJobEvent({
+            jobId: job.id,
+            projectId,
+            kind: "error",
+            label: "خطأ في التنفيذ",
+            detail: message.slice(0, 500),
+            ok: false,
+            durationMs: Date.now() - startedAt,
+            attempt: job.attempts,
+          });
+          return Response.json({ ok: false, jobId: job.id, error: message, retry });
+        }
+      },
+    },
+  },
+});

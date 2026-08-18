@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  app:
+    image: weaver-app:staging
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=staging
+      - DATABASE_URL=${DATABASE_URL_STAGING}
+      - REDIS_URL=${REDIS_URL_STAGING}
+      - SESSION_SECRET=${SESSION_SECRET_STAGING}
+      - SENTRY_ENVIRONMENT=staging
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/staging.conf:/etc/nginx/conf.d/default.conf:ro
+      - certs:/etc/nginx/certs
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=${DB_USER_STAGING}
+      - POSTGRES_PASSWORD=${DB_PASSWORD_STAGING}
+      - POSTGRES_DB=${DB_NAME_STAGING}
+    volumes:
+      - pgdata_staging:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER_STAGING} -d ${DB_NAME_STAGING}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass ${REDIS_PASSWORD_STAGING}
+    volumes:
+      - redisdata_staging:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  pgdata_staging:
+  redisdata_staging:
+  certs:

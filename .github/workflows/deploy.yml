@@ -1,0 +1,102 @@
+name: Deploy — Weaver Production
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - ".github/workflows/ci.yml"
+
+  workflow_dispatch:
+    inputs:
+      rollback:
+        description: "رقم الـ commit للتراجع إليه (اتركه فارغاً للنشر الطبيعي)"
+        required: false
+
+jobs:
+  deploy:
+    name: "🚀 Deploy to Production"
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ─── التحقق من المتغيّرات الضرورية ────────────────────────────────────
+      - name: Validate secrets
+        run: |
+          [[ -z "${{ secrets.DEPLOY_HOST }}" ]] && echo "❌ DEPLOY_HOST مفقود" && exit 1
+          [[ -z "${{ secrets.DEPLOY_KEY }}" ]] && echo "❌ DEPLOY_KEY مفقود" && exit 1
+          [[ -z "${{ secrets.DEPLOY_USER }}" ]] && echo "❌ DEPLOY_USER مفقود" && exit 1
+          echo "✅ Secrets متوفرة"
+
+      # ─── النشر عبر SSH ─────────────────────────────────────────────────────
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          ROLLBACK_TO: ${{ github.event.inputs.rollback }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          envs: IMAGE_TAG,ROLLBACK_TO
+          script: |
+            set -e
+            cd /opt/weaver
+
+            if [[ -n "$ROLLBACK_TO" ]]; then
+              echo "⏮️ التراجع إلى: $ROLLBACK_TO"
+              docker pull ghcr.io/${{ github.repository }}:$ROLLBACK_TO
+              IMAGE_TAG=$ROLLBACK_TO
+            fi
+
+            echo "📦 سحب الصورة: $IMAGE_TAG"
+            docker pull ghcr.io/${{ github.repository }}:$IMAGE_TAG
+
+            echo "🔄 تحديث الصورة في compose"
+            export WEAVER_IMAGE=ghcr.io/${{ github.repository }}:$IMAGE_TAG
+
+            # Blue/Green Deployment
+            echo "🟢 تشغيل الحاوية الجديدة (Green)"
+            docker compose -f docker-compose.yml up -d --no-deps --scale app=2 app
+            sleep 10
+
+            echo "🏥 فحص صحة الحاوية الجديدة"
+            docker compose exec -T app curl -f http://localhost:3000/api/health || {
+              echo "❌ فحص الصحة فشل — التراجع التلقائي"
+              docker compose up -d --no-deps app
+              exit 1
+            }
+
+            echo "🔵 إيقاف الحاوية القديمة"
+            docker compose up -d --no-deps --scale app=1 app
+
+            echo "✅ النشر ناجح: $IMAGE_TAG"
+
+      # ─── فحص ما بعد النشر ─────────────────────────────────────────────────
+      - name: Post-deploy smoke test
+        run: |
+          sleep 15
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://${{ secrets.DEPLOY_HOST }}/api/health")
+          if [ "$STATUS" != "200" ]; then
+            echo "❌ Smoke test فشل — HTTP $STATUS"
+            exit 1
+          fi
+          echo "✅ Smoke test ناجح — HTTP $STATUS"
+
+      # ─── إشعار النجاح ─────────────────────────────────────────────────────
+      - name: Notify on success
+        if: success()
+        run: |
+          echo "🎉 النشر ناجح: ${{ github.sha }}"
+
+      # ─── إشعار الفشل ──────────────────────────────────────────────────────
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ النشر فشل — يرجى المراجعة"
