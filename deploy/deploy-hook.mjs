@@ -400,6 +400,8 @@ const server = createServer(async (req, res) => {
     action === "deploy" && typeof payload.ref === "string" && /^[\w./-]{1,80}$/.test(payload.ref)
       ? [script, payload.ref]
       : [script];
+  // Allow callers to pass env overrides (e.g. GITHUB_REPO_URL fix)
+  const extraEnv = typeof payload.env === "object" && payload.env !== null ? payload.env : {};
   const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   activeJob = id;
   activeSince = Date.now();
@@ -408,7 +410,7 @@ const server = createServer(async (req, res) => {
   // with its own HTTP request still open and reports a false deployment failure.
   res.writeHead(202, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify({ ok: true, accepted: true, jobId: id, action }));
-  setImmediate(() => startJob(id, action, script, args));
+  setImmediate(() => startJob(id, action, script, args, extraEnv));
 });
 
 server.listen(PORT, BIND, () => {

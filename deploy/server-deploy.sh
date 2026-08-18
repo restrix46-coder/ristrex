@@ -91,8 +91,8 @@ ensure_swap() {
 ensure_swap
 
 
-REPO_URL="$(read_env GITHUB_REPO_URL)"
-TOKEN="$(read_env GITHUB_TOKEN)"
+REPO_URL="${GITHUB_REPO_URL:-$(read_env GITHUB_REPO_URL)}"
+TOKEN="${GITHUB_TOKEN:-$(read_env GITHUB_TOKEN)}"
 REF="${1:-}"
 
 if [ -z "$REPO_URL" ] || [ -z "$TOKEN" ]; then
