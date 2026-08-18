@@ -19,6 +19,7 @@
     "smoke-test": "node --import tsx/esm src/scripts/run-smoke-tests.ts"
   },
   "dependencies": {
+    "@ai-sdk/google": "^4.0.44",
     "@ai-sdk/openai": "^4.0.30",
     "@ai-sdk/openai-compatible": "^3.0.25",
     "@ai-sdk/react": "^4.0.55",

@@ -1,4 +1,4 @@
-import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { GEMINI_API_KEY } from "@/lib/env.server";
 
 export type BuildProviderId = "gemini";
@@ -14,7 +14,16 @@ export function buildProviderStatus() {
 export interface BuildModel {
   provider: BuildProviderId;
   modelId: string;
-  model: ReturnType<ReturnType<typeof createOpenAICompatible>>;
+  model: ReturnType<ReturnType<typeof createGoogleGenerativeAI>>;
+}
+
+/** تطبيع أسماء النماذج للنماذج الموثوقة */
+function pickModel(preferred: string | null): string {
+  if (!preferred || preferred === "auto") return "gemini-flash-latest";
+  if (preferred.includes("1.5-flash") || preferred.includes("2.0-flash") || preferred.includes("3.6")) return "gemini-flash-latest";
+  if (preferred.includes("1.5-pro") || preferred.includes("2.0-pro") || preferred === "gemini-pro") return "gemini-pro-latest";
+  if (preferred.includes("2.5-flash")) return "gemini-flash-latest";
+  return preferred;
 }
 
 export function resolveBuildModel(_preferredModel: string | null, _origin?: string): BuildModel {
@@ -24,36 +33,14 @@ export function resolveBuildModel(_preferredModel: string | null, _origin?: stri
     throw new Error("مفتاح GEMINI_API_KEY غير مضبوط!");
   }
 
-  const customFetch = async (url: string, init?: RequestInit) => {
-    let retries = 3;
-    let delay = 2000;
-    while (true) {
-      const response = await fetch(url, init);
-      if (response.status === 503 && retries > 0) {
-        retries--;
-        await new Promise(resolve => setTimeout(resolve, delay));
-        delay += 1500;
-        continue;
-      }
-      return response;
-    }
-  };
-
-  const provider = createOpenAICompatible({
-    name: "gemini",
-    baseURL: "https://generativelanguage.googleapis.com/v1beta/openai",
+  // @ai-sdk/google الأصلي — يدعم tools بشكل كامل مع Gemini
+  // OpenAI-compat كان يعيد empty content ويسبب "model output must contain output text or tool calls"
+  const provider = createGoogleGenerativeAI({
     apiKey: geminiKey,
-    fetch: customFetch,
   });
-  
-  const modelId = _preferredModel ?? "gemini-pro-latest";
-  
-  let finalModelId = modelId;
-  if (modelId.includes("1.5-flash") || modelId.includes("2.0-flash")) {
-    finalModelId = "gemini-flash-latest";
-  } else if (modelId.includes("1.5-pro") || modelId.includes("2.0-pro") || modelId === "gemini-pro") {
-    finalModelId = "gemini-pro-latest";
-  }
+
+  const finalModelId = pickModel(_preferredModel);
 
   return { provider: "gemini", modelId: finalModelId, model: provider(finalModelId) };
 }
+
